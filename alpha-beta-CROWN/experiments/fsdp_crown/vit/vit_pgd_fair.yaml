@@ -1,0 +1,35 @@
+model:
+  onnx_path: ../experiments/fsdp_crown/vit/onnx/pgd_2_3_16.onnx
+specification:
+  vnnlib_path: ../experiments/fsdp_crown/vit/vnnlib/pgd_2_3_16_4021.vnnlib
+solver:
+  batch_size: 32
+  auto_enlarge_batch_size: false
+  min_batch_size_ratio: 0.0
+  alpha-crown:
+    lr_alpha: 0.5
+    iteration: 50
+    max_time: 0.3
+    disable_optimization: ['Exp']
+  beta-crown:
+    lr_alpha: 0.05
+    lr_beta: 0.05
+    iteration: 10
+  forward_before_compute_bounds: true
+attack:
+  pgd_order: skip
+bab:
+  timeout: 600
+  max_iterations: 10
+  pruning_in_iteration: false
+  force_synchronous: true
+  branching:
+    reduceop: min
+general:
+  device: cuda
+  complete_verifier: bab
+  loss_reduction_func: min
+  sparse_alpha: false
+  sparse_interm: false
+  conv_mode: matrix
+  adhoc_tuning: Customized("custom_adhoc_tuning", "customized_vit_tuning")

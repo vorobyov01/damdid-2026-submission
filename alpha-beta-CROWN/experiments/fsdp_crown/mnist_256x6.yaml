@@ -1,0 +1,17 @@
+model:
+  onnx_path: ../experiments/vnncomp_tp/models/mnist-net_256x6.onnx
+specification:
+  vnnlib_path: ../experiments/vnncomp_tp/vnnlib/prop_0_0.03.vnnlib
+solver:
+  batch_size: 2048
+  bound_prop_method: alpha-crown
+  alpha-crown:
+    iteration: 20
+    lr_alpha: 0.1
+attack:
+  pgd_order: skip
+bab:
+  timeout: 10
+general:
+  device: cuda
+  complete_verifier: skip

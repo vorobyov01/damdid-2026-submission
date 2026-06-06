@@ -1,0 +1,24 @@
+model:
+  onnx_path: ../experiments/fsdp_crown/wide_mlp/onnx/wide_mlp_4096x4.onnx
+specification:
+  vnnlib_path: ../experiments/fsdp_crown/wide_mlp/vnnlib/wide_mlp_4096x4.vnnlib
+solver:
+  batch_size: 64
+  auto_enlarge_batch_size: false
+  beta-crown:
+    iteration: 20
+    lr_beta: 0.03
+    lr_alpha: 0.1
+  alpha-crown:
+    iteration: 20
+    lr_alpha: 0.1
+attack:
+  pgd_order: skip
+bab:
+  timeout: 1800
+  max_iterations: 5
+  pruning_in_iteration: false
+  force_synchronous: true
+general:
+  device: cuda
+  complete_verifier: bab

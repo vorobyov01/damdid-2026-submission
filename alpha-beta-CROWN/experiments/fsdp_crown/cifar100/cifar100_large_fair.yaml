@@ -1,0 +1,31 @@
+model:
+  onnx_path: ../experiments/fsdp_crown/cifar100/onnx/CIFAR100_resnet_large.onnx
+  onnx_optimization_flags: ["merge_bn"]
+specification:
+  vnnlib_path: ../experiments/fsdp_crown/cifar100/vnnlib/CIFAR100_resnet_large_prop_idx_3460_sidx_302_eps_0.0039.vnnlib
+attack:
+  pgd_order: skip
+solver:
+  batch_size: 64
+  auto_enlarge_batch_size: false
+  beta-crown:
+    lr_alpha: 0.1
+    lr_beta: 0.2
+    iteration: 10
+  alpha-crown:
+    lr_alpha: 0.25
+    iteration: 20
+    full_conv_alpha: false
+bab:
+  timeout: 600
+  max_iterations: 5
+  pruning_in_iteration: false
+  force_synchronous: true
+  interm_transfer: false
+  branching:
+    method: kfsb
+    candidates: 7
+    reduceop: max
+general:
+  device: cuda
+  complete_verifier: bab
