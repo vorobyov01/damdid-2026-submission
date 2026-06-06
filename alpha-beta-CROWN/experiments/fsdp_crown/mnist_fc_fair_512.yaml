@@ -1,0 +1,24 @@
+model:
+  onnx_path: ../experiments/vnncomp_tp/models/mnist-net_256x6.onnx
+specification:
+  vnnlib_path: ../experiments/vnncomp_tp/vnnlib/prop_0_0.05.vnnlib
+solver:
+  batch_size: 512
+  auto_enlarge_batch_size: false
+  beta-crown:
+    iteration: 20
+    lr_beta: 0.03
+    lr_alpha: 0.1
+  alpha-crown:
+    iteration: 20
+    lr_alpha: 0.1
+attack:
+  pgd_order: skip
+bab:
+  timeout: 600
+  max_iterations: 10
+  pruning_in_iteration: false
+  force_synchronous: true
+general:
+  device: cuda
+  complete_verifier: bab
