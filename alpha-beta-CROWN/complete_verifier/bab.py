@@ -47,6 +47,33 @@ def get_split_depth(batch_size, min_batch_size, min_depth):
     else:
         return min_depth
 
+
+def _dp_domain_count(d):
+    """Number of domains currently held in a domain dict."""
+    for key in ('lower_bounds', 'upper_bounds'):
+        if isinstance(d.get(key), dict) and d[key]:
+            return next(iter(d[key].values())).shape[0]
+    raise RuntimeError('cannot infer domain count')
+
+
+def _dp_finish_round(net, domains, d, ret, split, stats, fix_interm_bounds,
+                     set_init_alpha, biccos_enable, iter_idx):
+    """Bookkeeping shared with the replicated path, on the gathered results."""
+    from prune import prune_alphas
+    if set_init_alpha:
+        ret['alphas'] = prune_alphas(ret['alphas'], net.alpha_start_nodes)
+        domains.init_alpha = {
+            k: {kk: vv[:, :, :1].detach().clone().to(net.device).to(
+                torch.get_default_dtype()) for kk, vv in v.items()}
+            for k, v in ret['alphas'].items()}
+    elif not fix_interm_bounds:
+        ret['alphas'] = prune_alphas(ret['alphas'], net.alpha_start_nodes)
+    stats.timer.start('add')
+    domains.add(ret, d, check_infeasibility=not fix_interm_bounds)
+    domains.print()
+    stats.timer.add('add')
+    return ret
+
 def split_domain(net: LiRPANet, domains, d, batch, stats=None,
                  set_init_alpha=False, fix_interm_bounds=True,
                  branching_heuristic=None, iter_idx=None):
@@ -136,6 +163,50 @@ def split_domain(net: LiRPANet, domains, d, batch, stats=None,
     import torch.distributed as _dist
     _dp_active = _dist.is_initialized() and _dist.get_world_size() > 1
     _sync_mode = _dp_active or arguments.Config['bab'].get('force_synchronous', False)
+    _dp_split = (_dp_active
+                 and arguments.Config['bab'].get('domain_parallel', False)
+                 and _dp_domain_count(d) >= _dist.get_world_size() * 2
+                 and len(split['decision']) == _dp_domain_count(d)
+                 and split.get('points', None) is None)
+
+    if _dp_split:
+        # EXPERIMENTAL, off by default (bab.domain_parallel).  Per-rank
+        # propagation is correct -- each rank builds its own state and bounds
+        # its own chunk -- but the gather of per-rank results below does not yet
+        # complete on every configuration, so this path is published for
+        # reference rather than for use.  It also requires FSDP_DISABLE=1:
+        # FSDP's per-layer AllGather is interleaved with data-dependent control
+        # flow and desynchronises once ranks hold different subdomains.
+        arguments.Config['bab']['pruning_in_iteration'] = False
+        net.net.set_bound_opts({'optimize_bound_args': {
+            'early_stop_patience': int(1e9)}})
+        _rank, _ws = _dist.get_rank(), _dist.get_world_size()
+        from bab_parallel import (scatter_domain_dict, gather_result_dict,
+                                  _chunk_range)
+        _global_batch = _dp_domain_count(d)
+        _lo, _hi = _chunk_range(_global_batch, _rank, _ws)
+        d_local = scatter_domain_dict(d, _rank, _ws)
+        split_local = dict(split)
+        split_local['decision'] = split['decision'][_lo:_hi]
+        # Build the model state for this rank's chunk only.
+        net.build_history_and_set_bounds(d_local, split_local, mode='depth')
+        stats.visited += _global_batch
+        stats.timer.add('set_bounds')
+        stats.timer.start('solve')
+        ret_local = net.update_bounds(
+            d_local, fix_interm_bounds=fix_interm_bounds,
+            stop_criterion_func=lambda x: False,
+            multi_spec_keep_func=multi_spec_keep_func_all,
+            beta_bias=branching_points is not None,
+            enable_clip_domains=enable_clip_domains,
+        )
+        ret = gather_result_dict(ret_local, _ws)
+        d = gather_result_dict(d_local, _ws)
+        stats.timer.add('solve')
+        del d_local, ret_local
+        return _dp_finish_round(net, domains, d, ret, split, stats,
+                                fix_interm_bounds, set_init_alpha,
+                                biccos_enable, iter_idx)
 
     if _sync_mode:
         # With FSDP, all ranks must iterate the same number of times in

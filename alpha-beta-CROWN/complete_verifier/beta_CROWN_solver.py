@@ -110,8 +110,10 @@ class LiRPANet:
         )
         eval(general_args['graph_optimizer'])(self.net)
 
+        import os as _os
         import torch.distributed as dist
-        if dist.is_initialized() and dist.get_world_size() > 1:
+        if (dist.is_initialized() and dist.get_world_size() > 1
+                and _os.environ.get('FSDP_DISABLE', '0') != '1'):
             from auto_LiRPA.fsdp_utils import fsdp_shard_bounded_module
             fsdp_shard_bounded_module(
                 self.net, dist.get_world_size(), dist.get_rank(),
