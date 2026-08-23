@@ -527,6 +527,12 @@ class ConfigHandler:
                                'no pruning_in_iteration, no auto_enlarge_batch_size) even '
                                'on a single GPU. Used for fair single-vs-FSDP memory comparison.',
                           hierarchy=h + ["force_synchronous"])
+        self.add_argument("--domain_parallel", action='store_true',
+                          help='Split each BaB batch of domains across the ranks of '
+                               'the process group, so that every GPU propagates '
+                               'batch/P subdomains and the results are gathered. '
+                               'Shards the axis that dominates BaB memory.',
+                          hierarchy=h + ["domain_parallel"])
         self.add_argument("--override_timeout", type=float, default=None,
                           help='Override timeout.',
                           hierarchy=h + ["override_timeout"])

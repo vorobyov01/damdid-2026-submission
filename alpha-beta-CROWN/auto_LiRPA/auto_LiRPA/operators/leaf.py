@@ -78,6 +78,10 @@ class BoundParams(BoundInput):
     def forward(self):
         param = self.param
         ws = getattr(self, '_fsdp_world_size', 0)
+        if ws > 1 and getattr(self, '_cpu_offload', False):
+            # Naive baseline: stage the host-resident weight to the device.
+            param = param.data.to('cuda', non_blocking=True)
+            ws = 0
         if ws > 1:
             import torch.distributed as dist
             parts = [torch.empty_like(param) for _ in range(ws)]

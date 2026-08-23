@@ -97,6 +97,9 @@ def _refresh_graph_shapes(model: 'BoundedModule', dummy_input: torch.Tensor):
         model.forward(dummy_input)
 
 
+_OFFLOAD_STATS = {'calls': 0, 'bytes': 0}
+
+
 def fsdp_gather_node(node):
     """AllGather a sharded BoundParams to full size.
 
@@ -108,10 +111,29 @@ def fsdp_gather_node(node):
         return
     if getattr(node, 'forward_value', None) is not None:
         return  # already gathered
+    if getattr(node, '_cpu_offload', False):
+        # Naive baseline: the weight lives in pinned host memory and is staged
+        # to the device per layer instead of being AllGathered from shards.
+        full = node.param.data.to('cuda', non_blocking=True)
+        node.forward_value = full
+        node.lower = full
+        node.upper = full
+        node.interval = (full, full)
+        _OFFLOAD_STATS['calls'] += 1
+        _OFFLOAD_STATS['bytes'] += full.numel() * full.element_size()
+        return
     param = node.param.data
-    parts = [torch.empty_like(param) for _ in range(ws)]
-    dist.all_gather(parts, param)
-    full = torch.cat(parts, dim=node._fsdp_shard_dim)
+    with torch.no_grad():
+        # Single flat destination buffer: all_gather_into_tensor concatenates
+        # along dim 0, which is the shard dimension for BoundLinear
+        # ([out, in]) and BoundConv ([out_c, in_c, kH, kW]) alike.  Building
+        # the full weight with torch.cat instead would allocate it twice and,
+        # because cat is recorded by autograd, would keep every gathered
+        # weight of the pass reachable from the returned bounds.
+        assert node._fsdp_shard_dim == 0
+        full = torch.empty((param.shape[0] * ws, *param.shape[1:]),
+                           dtype=param.dtype, device=param.device)
+        dist.all_gather_into_tensor(full, param.contiguous())
     node.forward_value = full
     node.lower = full
     node.upper = full
@@ -129,11 +151,14 @@ def fsdp_free_node(node):
     ws = getattr(node, '_fsdp_world_size', 0)
     if ws <= 1:
         return
-    for name in ('forward_value', 'lower', 'upper', 'interval'):
+    for name in ('forward_value', 'interval'):
         try:
             delattr(node, name)
         except AttributeError:
             pass
+    # lower / upper are properties over _lower / _upper, so delattr on them
+    # raises AttributeError and would leave the gathered full weight alive.
+    node.delete_lower_and_upper_bounds()
 
 
 def fsdp_free_gathered_weights(model: 'BoundedModule'):
