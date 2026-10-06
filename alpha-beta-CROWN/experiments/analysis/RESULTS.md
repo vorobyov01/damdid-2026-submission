@@ -1,27 +1,28 @@
-# DAMDID revision: measured results (4x RTX PRO 4000 Blackwell 24GB, torch 2.8.0+cu128, NCCL, PCIe)
+# Measured results behind the paper (4x RTX PRO 4000 Blackwell 24GB, torch 2.8.0+cu128, NCCL, PCIe)
 
 All runs: seed 42, eps=0.02, input 784, batch 1, CROWN, 1 warm-up + 3 repeats,
 one mode per process unless stated.  std over repeats was 0.00 MB for every
 memory figure.
 
-## 1. The published 34-39% FSDP peak saving is a measurement artefact
+## 1. Why each mode is measured in its own process
 
-memory_experiment.py measures both modes in one process, FSDP first, and returns
-the bound tensors to the caller.  For FSDP those tensors carry an autograd graph
-that keeps ~1.9 GB of intermediates alive, so the *second* measurement counts
-them as its own peak.
+The older harness, fsdp_crown/memory_experiment.py, measures both modes in one
+process, FSDP first, and returns the bound tensors to the caller.  For FSDP
+those tensors carry an autograd graph that keeps ~1.9 GB of intermediates
+alive, so the *second* measurement counts them as its own peak.  mem_time.py
+runs one mode per process.
 
-| protocol (h=4096, d=4)                     | single  | FSDP=2 | "saving" |
-|--------------------------------------------|---------|--------|----------|
-| original script (reproduces the paper)      | 3799.6  | 2526.9 | +33.5%   |
-| one mode per process                        | 1944.9  | 2526.9 | -29.9%   |
-| same process, bounds released               | 1944.9  | 2526.9 | -29.9%   |
-| same process, bounds retained, single 2nd   | 4208.6  | 2526.9 | +40.0%   |
-| same process, bounds retained, FSDP 2nd     | 1944.9  | 4158.7 | -113.8%  |
+| protocol (h=4096, d=4)                      | single  | FSDP=2 |
+|---------------------------------------------|---------|--------|
+| memory_experiment.py (FSDP first, retained) | 3799.6  | 2526.9 |
+| one mode per process                        | 1944.9  | 2526.9 |
+| same process, bounds released               | 1944.9  | 2526.9 |
+| same process, bounds retained, single 2nd   | 4208.6  | 2526.9 |
+| same process, bounds retained, FSDP 2nd     | 1944.9  | 4158.7 |
 
 transient (peak - resident) is invariant: 1527.7 MB single, 2109.7 MB FSDP.
 
-## 2. Corrected FSDP measurements, before the fix
+## 2. FSDP measurements before the fixes of section 4
 
 | config          | single peak | FSDP=2 | FSDP=4 | single wall | FSDP=2 wall (comm) |
 |-----------------|-------------|--------|--------|-------------|--------------------|
@@ -30,14 +31,18 @@ transient (peak - resident) is invariant: 1527.7 MB single, 2109.7 MB FSDP.
 | h=8192, d=4     |  7593.9     | 9781.7 | 9781.4 |  418.1 ms   |  999.3 ms (590.4)  |
 | h=4096, d=8     |  7934.0     |10232.0 |10231.8 |  381.1 ms   |  881.5 ms (516.9)  |
 
-Paper's single-GPU figures were 3800 / 14759 / 16726 -> inflated 1.94-2.11x.
-Paper's FSDP figures reproduce exactly (2527 / 9782 / 10232).
 P=4 never improves peak over P=2.
 
 ## 3. Baseline "exactly 1/P" is bookkeeping, not memory
 
 BoundParams bytes 204.5 -> 102.3 MB (exactly 1/2), but really allocated memory
-417.2 -> 417.2 MB (ratio 1.000): the AllGathered full weights were never freed.
+417.2 -> 417.2 MB (ratio 1.000).  One reason: fsdp_shard_bounded_module builds
+the shard as W[r*chunk:(r+1)*chunk].contiguous(), and a dim-0 slice of a
+contiguous tensor is already contiguous, so the shard is a view and the full
+storage stays allocated (before fix 2 the cached _lower/_upper also kept it).
+This is not fixed in the measured code.  Releasing it would lower each FSDP
+peak by (1-1/P)*S_W, which is less than the gap to the single-GPU peak in every
+configuration of section 9.
 
 ## 4. Root cause and fix
 
@@ -68,15 +73,14 @@ every configuration, and identical at P=2 and P=4.
 
 ## 5. Peak is dominated by A-matrices, not weights (CROWN, incomplete)
 
-Backward trace, h=4096 d=4 single: allocated grows 417 -> 1844 MB in 128 MB
-steps, every step an A-matrix pair of shape [4096,1,4096]; weights are 204 MB of
+Backward trace, h=4096 d=4 single: allocated grows 417 -> 1844 MB, mostly in
+128 MB steps (one A-matrix pair of shape [4096,1,4096] each); weights are 204 MB of
 the 1945 MB peak.
 
 ## 6. TP: near-linear scaling of both peak memory and propagation time
 
 H=131072, D=4096, N=2048, eps=0.01, CROWN, graph construction timed separately
-from bound propagation (the construction cost is one-off; the earlier combined
-figure hid this):
+from bound propagation (the construction cost is one-off):
 
 | mode   | peak (MB) | reduction | build (ms) | propagation (ms) | speed-up | comm (ms) |
 |--------|-----------|-----------|------------|------------------|----------|-----------|
@@ -84,24 +88,28 @@ figure hid this):
 | TP=2   |   6856.7  |  1.97x    |  22679.8   |      287.7       |  1.90x   |    89.2   |
 | TP=4   |   3528.4  |  3.83x    |  11392.1   |      156.5       |  3.49x   |   139.9   |
 
-single at H=131072 equals the paper's TP=2 rank figure at H=262144 (13513 MB):
-the TP memory model is exact.  Collectives are 7 calls, <1% of propagation time.
+single at H=131072 equals the TP=2 per-rank peak at H=262144 measured on 2x A40
+(13513 MB): the TP memory model is exact.  comm (ms) is the time inside the 7
+AllReduce calls, measured with CUDA events from before graph construction, so
+it includes the build-phase forward and waiting for the slower rank.
 Graph construction under TP is 5.3x slower than dense at P=2 (JIT tracing of the
 custom Col/Row operators) but is paid once per model.
 
-CAVEAT, and it must go into the paper: on this very model the TP bounds are
-meaningless -- lb_sum = -3.35e8 versus -6.65e3 for single GPU -- because the
-ReLU sits inside the sharded zone and its intermediate bounds fall back to IBP.
-The 2x memory reduction of the paper's Experiment 1 was reported on a model
-whose bounds are useless.  TP is only usable when the sharded zone contains no
-intermediate activation.
+Bounds are not comparable in this script: SimpleTPModel and SimpleDenseModel
+are initialised independently (torch.randn vs. the nn.Linear default, and every
+rank uses the same seed), so lb_sum differs by construction (-3.35e8 vs
+-6.65e3).  Use tp_model.copy_dense_weights_to_tp for a bound comparison.  The
+model is a single zone fed directly by the input box, where the IBP fallback is
+exact; the 256x2 models of vnncomp_tp/verify_tp.py have the same structure and
+agree to 3e-8.
 
 ## 6b. alpha-CROWN under TP is sound and matches to machine precision
 
 experiments/alpha_crown/run.py, single-GPU reference vs TP=2:
 lb max_abs_diff = 4.47e-08, mean 2.14e-08, max_rel_diff = 3.64e-07, PASS at
-tolerance 1e-4; the TP lower bound came out 0.000804 tighter.  This closes
-reviewer 1's remark that TP soundness was demonstrated for CROWN only.
+tolerance 1e-4.  The 0.000804 that the script also prints is the mean
+improvement of alpha-CROWN over CROWN within the same run, not a difference
+between TP and single GPU.  Test model: script defaults (hidden 16, batch 4).
 
 ## 7. BaB memory is linear in the number of domains; weights are noise
 
@@ -112,23 +120,27 @@ mnist-net_256x6, eps=0.05, force_synchronous, 10 BaB rounds, single GPU:
 |   128 |  3.79 | 0.01 |  9.06         |  9.08 | 2.03    |    68.73     |
 |   256 |  7.58 | 0.02 | 18.13         | 18.16 | 2.03    |   116.24     |
 |   512 | 15.16 | 0.05 | 36.26         | 36.33 | 2.03    |   211.93     |
+|  1024 | 30.31 | 0.10 | 72.51         | 72.66 | 2.03    |   402.52     |
+|  2048 | 60.62 | 0.20 | 145.03        |145.32 | 2.03    |   780.72     |
+|  4096 |121.25 | 0.40 | 290.06        |290.64 | 2.03    |  1543.61     |
 
-peak(B) ~ 21.0 + 0.373*B MB (paper's Table 5: 211.7 @512, 1537.3 @4096 -> same law).
+peak(B) ~ 21.3 + 0.372*B MB (least squares over the six rows).
 Every batch-scaled term doubles with B; weights stay 2.03 MB.
-Hence splitting the *domain* axis over P GPUs gives per-GPU peak 21 + 0.373*B/P:
-45% saving at P=2 and 68% at P=4 for B=512, and the projection is validated by
-the measured single-GPU point at B/P (116.24 measured vs 116.5 predicted).
+Hence splitting the *domain* axis over P GPUs gives per-GPU peak
+21.3 + 0.372*B/P: 45.0% saving at P=2 and 67.5% at P=4 for B=512.  The per-GPU
+workload of such a split is the single-GPU run at B/P (116.24 MB at B=256); the
+cost of gathering per-rank results is not included.
 
 ## 8. BaB under FSDP, same workload (mnist-net_256x6, batch 512)
 
 single 211.93 MB, FSDP=2 214.88 MB, FSDP=4 214.87 MB per rank: sharding 2.03 MB
 of weights cannot pay for the AllGather buffers, and P=4 changes nothing.
-Breakdown at batch 4096: alpha 121.25 MB (17.2%), interm bounds and lA/uA ~40%
-each, weights 2.03 MB (0.13%).  The paper's claim that alpha tensors occupy
-~1.5 GB conflates alphas with the whole peak: 1.5 GB is the peak, alphas are
-121 MB of it.  The correct statement is that every batch-scaled term (alphas,
-intermediate bounds, A-matrices) grows linearly in the number of domains while
-weights stay constant.
+Breakdown at batch 4096 (peak 1543.6 MB): alpha 121.25 MB (7.9% of the peak),
+interm bounds and lA/uA ~290 MB each (18.8%), weights 2.03 MB (0.13%).  The
+tracked classes add up to 704 MB; the untracked remainder (~54% of the peak)
+also grows linearly with B (45 / 122 / 839 MB at B = 128 / 512 / 4096).  Every
+batch-scaled term grows linearly in the number of domains while weights stay
+constant.
 
 ## 9. Naive baseline: CPU offloading beats FSDP on both axes
 

@@ -22,18 +22,25 @@ BSD 3-Clause license; see [License & Attribution](#license--attribution).
 - **Tensor Parallelism for bound propagation.** New operators
   `BoundLinearTP_Col` / `BoundLinearTP_Row` shard both weight and CROWN
   `A`-matrices across GPUs (one `AllReduce` per Column–Row pair), with automatic
-  graph sharding via `tp_shard_bounded_module`. Gives ≈2× peak-memory reduction
-  at `P=2`; sound on VNN-COMP MNIST-FC.
+  graph sharding via `tp_shard_bounded_module`. Peak memory drops 1.97× at
+  `P=2` and 3.83× at `P=4`, and propagation gets 1.90× and 3.49× faster. Bounds
+  are exact for the first sharded zone; later zones fall back to IBP.
 - **FSDP for bound propagation.** `fsdp_shard_bounded_module` shards only weight
-  matrices (per-layer `AllGather`), producing **bitwise-identical** bounds.
-  Baseline weight storage drops by exactly `1/P` (50% at `P=2`); peak memory by
-  34–39% on wide MLPs.
+  matrices (per-layer `AllGather`) and produces **bitwise-identical** bounds.
+  Weights are a small share of the peak in bound propagation, so FSDP does not
+  lower peak memory: on wide MLPs it raises it by 26–34%, and staging the
+  weights from host memory does better.
+- **Memory measurements** (`experiments/analysis/`): a per-node trace of a
+  CROWN pass, a batch sweep for β-CROWN+BaB (peak ≈ 21.3 + 0.372·B MB, weights
+  0.13%) and a CPU-offload baseline. The collated numbers are in
+  `experiments/analysis/RESULTS.md`.
 - **FSDP in complete verification** (β-CROWN + Branch-and-Bound), with a
-  `force_synchronous` flag for fair single-GPU vs. FSDP comparison.
+  `force_synchronous` flag that makes single-GPU and FSDP runs do the same work.
 - **Convolutional sharding** (`BoundConv`, sharded over output channels);
-  validated on CIFAR-100 ResNets (VNN-COMP'24).
+  checked on CIFAR-100 ResNets (VNN-COMP'24).
 - **JIT fixes for Transformers** (`BoundReshape`, `BoundConcat`,
-  `BoundConstantOfShape`) enabling FSDP verification of a ViT (VNN-COMP'23).
+  `BoundConstantOfShape`) that let BaB run on a ViT (VNN-COMP'23) with sharded
+  weights.
 
 ---
 
@@ -54,31 +61,33 @@ alpha-beta-CROWN/                         # forked verifier (BSD-3-Clause)
 │   └── bab.py                            # DP integration + anti-deadlock
 └── experiments/                          # experiments from the paper
     ├── tp_model.py                       # shared TP / dense model, copy-weights
-    ├── crown/run.py                      # Exp. 1: TP OOM vs. single-GPU memory
-    ├── alpha_crown/run.py                # α-CROWN numeric single vs. TP comparison
-    ├── vnncomp_tp/verify_tp.py           # Exp. 2–3: TP correctness & soundness
-    └── fsdp_crown/                       # Exp. 4–8: FSDP
-        ├── verify_fsdp.py                # Exp. 4: bitwise-identical bounds
-        ├── memory_experiment.py          # Exp. 5: baseline / peak memory
+    ├── analysis/                         # §4, §5.1, §5.4, §5.5: memory and time, RESULTS.md
+    ├── alpha_crown/run.py                # §5.2: α-CROWN, single GPU vs. TP
+    ├── vnncomp_tp/verify_tp.py           # §5.2: TP correctness & soundness
+    ├── crown/run.py                      # TP vs. single-GPU memory at H=262144 (A40)
+    └── fsdp_crown/
+        ├── verify_fsdp.py                # §5.3: bitwise-identical bounds
         ├── run_abcrown_fsdp.py           # torchrun wrapper for abcrown+FSDP
-        ├── mnist_fc_fair_{512,4096}.yaml # Exp. 6: fair FSDP vs. single in BaB
-        ├── vit/                          # Exp. 7: ViT (VNN-COMP'23)
-        └── cifar100/                     # Exp. 8: ResNet conv sharding (VNN-COMP'24)
+        ├── mnist_fc_fair_{512,4096}.yaml # §5.5: same workload, single GPU vs. FSDP in BaB
+        ├── vit/                          # §5.6: ViT (VNN-COMP'23)
+        ├── cifar100/                     # §5.6: ResNet conv sharding (VNN-COMP'24)
+        └── memory_experiment.py          # older harness, superseded by analysis/mem_time.py
 ```
 
 ---
 
 ## Installation
 
-A CUDA GPU is required; multi-GPU experiments need ≥2 GPUs. The runs in the
-paper used 2× NVIDIA A40 (48 GB).
+A CUDA GPU is required; multi-GPU experiments need 2 or 4 GPUs. Most
+measurements in the paper used 4× NVIDIA RTX PRO 4000 Blackwell (24 GB); the
+ViT and CIFAR-100 checks used 2× NVIDIA A40 (48 GB).
 
 ```bash
 git clone https://github.com/vorobyov01/damdid-2026-submission.git
 cd damdid-2026-submission
 
-# uv.lock pins torch==2.8.x+cu128 (the only build compatible with the CUDA 12.8
-# driver on NVIDIA A40). Always use `uv sync`, not a manual pip install.
+# uv.lock pins torch==2.8.x+cu128 (the build that matches a CUDA 12.8 driver).
+# Always use `uv sync`, not a manual pip install.
 uv sync
 source .venv/bin/activate
 
@@ -97,74 +106,96 @@ Smoke test (single GPU):
 python alpha-beta-CROWN/auto_LiRPA/examples/simple/toy.py
 ```
 
-On pods **without NVLink**, prefix distributed runs with `NCCL_P2P_DISABLE=1`.
+On machines **without NVLink**, prefix distributed runs with
+`NCCL_P2P_DISABLE=1`.
 
 ---
 
 ## Reproducing the experiments
 
-All multi-GPU runs use `torchrun --nproc_per_node=2`. Paths below assume the
-repository root.
+Section numbers refer to the paper. Paths below assume the repository root.
+Run each mode in its own process: bound tensors returned under FSDP keep an
+autograd graph alive, and in a shared process that memory would be counted in
+the next measurement.
 
-### TP — Experiments 1–3
+### Memory and time of FSDP — §4, §5.4
+
+```bash
+cd alpha-beta-CROWN/experiments/analysis
+
+# single GPU, CPU offload and FSDP=2/4 at h=4096, d=4 (repeat for other h, d)
+python mem_time.py --mode single  --h 4096 --d 4
+python mem_time.py --mode offload --h 4096 --d 4
+torchrun --nproc_per_node=2 mem_time.py --mode fsdp --h 4096 --d 4
+torchrun --nproc_per_node=4 mem_time.py --mode fsdp --h 4096 --d 4
+
+# per-node memory trace of one CROWN pass (§4)
+python mem_time.py --mode single --h 4096 --d 4 --trace
+```
+
+### Tensor Parallelism — §5.1, §5.2
 
 ```bash
 cd alpha-beta-CROWN/experiments
 
-# Exp. 1: model that OOMs on one GPU, fits under TP=2 (peak-memory reduction)
-python crown/run.py        --mode single --input-dim 4096 --hidden-dim 262144 --batch-size 2048
-torchrun --nproc_per_node=2 crown/run.py --mode tp --input-dim 4096 --hidden-dim 262144 --batch-size 2048
+# memory and time scaling, graph construction timed separately (§5.1);
+# the single-GPU and TP runs use different random weights, so compare
+# memory and time only
+python analysis/tp_scaling.py --mode single --hidden-dim 131072
+torchrun --nproc_per_node=2 analysis/tp_scaling.py --mode tp --hidden-dim 131072
+torchrun --nproc_per_node=4 analysis/tp_scaling.py --mode tp --hidden-dim 131072
 
-# α-CROWN numeric comparison (bounds must match the single-GPU reference)
+# α-CROWN: bounds must match the single-GPU reference (§5.2)
 python alpha_crown/run.py --mode single --method alpha-CROWN --save ref.pt
 torchrun --nproc_per_node=2 alpha_crown/run.py --mode tp --method alpha-CROWN --compare ref.pt
 
-# Exp. 2–3: TP correctness & soundness on VNN-COMP MNIST-FC ONNX models
+# TP correctness & soundness on VNN-COMP MNIST-FC ONNX models (§5.2)
 bash vnncomp_tp/download_mnist_fc.sh
 torchrun --nproc_per_node=2 vnncomp_tp/verify_tp.py
 ```
 
-### FSDP — Experiments 4–5
+### FSDP bounds — §5.3
 
 ```bash
 cd alpha-beta-CROWN/experiments/fsdp_crown
 
-# Exp. 4: bounds bitwise-identical to single-GPU (IBP + CROWN)
+# bounds bitwise-identical to single-GPU (IBP + CROWN)
 torchrun --nproc_per_node=2 verify_fsdp.py
-
-# Exp. 5: baseline (exact 1/P) and peak (34–39%) memory savings
-torchrun --nproc_per_node=2 memory_experiment.py   # writes fsdp_memory_results.json
 ```
 
-### FSDP + complete verification — Experiments 6–8
+### Complete verification and other architectures — §5.5, §5.6
 
 ```bash
 cd alpha-beta-CROWN/complete_verifier
 
-# Exp. 6: fair single-GPU vs. FSDP=2 in β-CROWN+BaB (identical workload)
+# §5.5: same workload on one GPU and under FSDP=2
 CUDA_VISIBLE_DEVICES=0 python ../experiments/fsdp_crown/run_abcrown_fsdp.py \
   --config ../experiments/fsdp_crown/mnist_fc_fair_512.yaml
 NCCL_P2P_DISABLE=1 torchrun --nproc_per_node=2 \
   ../experiments/fsdp_crown/run_abcrown_fsdp.py \
   --config ../experiments/fsdp_crown/mnist_fc_fair_512.yaml
 
-# Exp. 7: ViT (VNN-COMP'23) — bitwise-identical bounds under FSDP
+# §5.5: memory by tensor class for one batch size
+python ../experiments/analysis/alpha_probe.py \
+  --config ../experiments/fsdp_crown/mnist_fc_fair_512.yaml --batch_size 4096
+
+# §5.6: ViT (VNN-COMP'23)
 bash ../experiments/fsdp_crown/vit/download_vit.sh
 NCCL_P2P_DISABLE=1 torchrun --nproc_per_node=2 \
   ../experiments/fsdp_crown/run_abcrown_fsdp.py \
   --config ../experiments/fsdp_crown/vit/vit_pgd_fair.yaml
 
-# Exp. 8: CIFAR-100 ResNet conv sharding (VNN-COMP'24)
+# §5.6: CIFAR-100 ResNet conv sharding (VNN-COMP'24)
 bash ../experiments/fsdp_crown/cifar100/download_cifar100.sh
 NCCL_P2P_DISABLE=1 torchrun --nproc_per_node=2 \
   ../experiments/fsdp_crown/run_abcrown_fsdp.py \
   --config ../experiments/fsdp_crown/cifar100/cifar100_large_fair.yaml
 ```
 
-The fair-comparison configs fix the batch size, disable
+The same-workload configs fix the batch size, disable
 `auto_enlarge_batch_size` / `early_stop` / `pruning_in_iteration`, and cap BaB
-rounds, so single-GPU and FSDP=2 perform an identical workload and peak memory
-is directly comparable.
+rounds, so single-GPU and FSDP=2 do the same work and peak memory is directly
+comparable.
 
 ---
 

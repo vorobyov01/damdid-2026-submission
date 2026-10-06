@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Is the published 34-39% FSDP peak saving an artefact of measurement order?
+"""How does measuring both modes in one process distort the FSDP comparison?
 
 The original memory_experiment.py measures FSDP and single-GPU in the SAME
 process, FSDP first.  This script reproduces that protocol and its mirror
